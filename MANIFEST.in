@@ -1,0 +1,10 @@
+include LICENSE
+include README.md
+include CONTRIBUTING.md
+include SECURITY.md
+recursive-include docs *.md
+recursive-include src/pyfilecage py.typed
+recursive-exclude tests *
+recursive-exclude .github *
+global-exclude __pycache__
+global-exclude *.py[co]

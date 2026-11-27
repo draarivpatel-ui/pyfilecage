@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a new detection, hardening control, integration, or test improvement
+title: "[feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What upload-security problem is not handled well today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Proposed API, default behavior, and opt-in behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: adversarial
+    attributes:
+      label: Adversarial considerations
+      description: How could the feature be abused? What false positives or resource exhaustion risks exist?
+    validations:
+      required: true
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      options:
+        - label: This proposal keeps runtime dependencies at zero and preserves Python 3.9 compatibility.
+          required: true

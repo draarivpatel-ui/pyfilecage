@@ -32,6 +32,55 @@ class RecordingStream:
         return self._seekable
 
 
+class ShortChunkStream:
+    """Deterministic raw-IO style adapter yielding short/odd chunks, empty reads, or faults."""
+
+    def __init__(
+        self,
+        data=b"",
+        chunk_sizes=(3, 5, 7),
+        *,
+        seekable=False,
+        empty_reads_at=(),
+        read_error=None,
+        seekable_error=None,
+    ):
+        self._data = bytes(data)
+        self._chunk_sizes = tuple(chunk_sizes) if chunk_sizes else (1,)
+        self._offset = 0
+        self._step = 0
+        self._seekable = seekable
+        self._empty_reads_at = set(empty_reads_at)
+        self._read_error = read_error
+        self._seekable_error = seekable_error
+        self.calls = []
+        self.bytes_returned = 0
+
+    def read(self, size=-1):
+        self.calls.append(size)
+        if size is None or size < 0:
+            raise AssertionError("unbounded read requested")
+        if self._read_error is not None:
+            raise self._read_error
+        step = self._step
+        self._step += 1
+        if step in self._empty_reads_at:
+            return b""
+        if self._offset >= len(self._data):
+            return b""
+        planned = self._chunk_sizes[step % len(self._chunk_sizes)]
+        take = min(size, planned, len(self._data) - self._offset)
+        chunk = self._data[self._offset : self._offset + take]
+        self._offset += len(chunk)
+        self.bytes_returned += len(chunk)
+        return chunk
+
+    def seekable(self):
+        if self._seekable_error is not None:
+            raise self._seekable_error
+        return self._seekable
+
+
 class ValidateFileObjTest(unittest.TestCase):
     def test_bytesio_png_passes(self):
         result = validate_file_obj(io.BytesIO(png()), filename="image.png", content_type="image/png")
@@ -91,6 +140,92 @@ class ValidateFileObjTest(unittest.TestCase):
     def test_filecage_stream_method(self):
         cage = FileCage({"preset": "images-safe"})
         self.assertTrue(cage.validate_file_obj(io.BytesIO(png()), filename="a.png", content_type="image/png").allowed)
+
+
+class ShortChunkStreamAdapterTest(unittest.TestCase):
+    def test_short_and_odd_chunks_assemble_valid_png(self):
+        payload = png()
+        stream = ShortChunkStream(payload, chunk_sizes=(1, 3, 5, 7, 2), seekable=False)
+        result = validate_file_obj(
+            stream,
+            filename="image.png",
+            content_type="image/png",
+            policy={"max_bytes": len(payload)},
+        )
+        self.assertTrue(result.allowed, [item.to_dict() for item in result.findings])
+        self.assertEqual(result.detected_format, "png")
+        self.assertEqual(stream.bytes_returned, len(payload))
+        self.assertGreater(len(stream.calls), 3)
+
+    def test_short_chunks_remain_bounded_at_max_bytes_plus_one(self):
+        payload = png() + b"x" * 200
+        limit = len(png())
+        stream = ShortChunkStream(payload, chunk_sizes=(3, 5, 7, 11), seekable=False)
+        result = validate_file_obj(
+            stream,
+            filename="image.png",
+            content_type="image/png",
+            policy={"max_bytes": limit},
+        )
+        self.assertFalse(result.allowed)
+        self.assertTrue(has_finding(result, "FILECAGE_MAX_BYTES"))
+        self.assertEqual(stream.bytes_returned, limit + 1)
+        self.assertEqual(result.size_bytes, limit + 1)
+        self.assertIsNone(result.sha256)
+        self.assertTrue(all(0 < req <= limit + 1 for req in stream.calls))
+
+    def test_repeated_empty_reads_cannot_hang_validation_loop(self):
+        stream = ShortChunkStream(
+            png(),
+            chunk_sizes=(5,),
+            seekable=False,
+            empty_reads_at=(0, 1, 2, 3, 4),
+        )
+        result = validate_file_obj(stream, filename="empty.png", content_type="image/png")
+        self.assertFalse(result.allowed)
+        self.assertEqual(len(stream.calls), 1)
+
+        mid_empty = ShortChunkStream(
+            png(),
+            chunk_sizes=(4,),
+            seekable=False,
+            empty_reads_at=(2, 3, 4),
+        )
+        mid_result = validate_file_obj(mid_empty, filename="partial.png", content_type="image/png")
+        self.assertFalse(mid_result.allowed)
+        self.assertEqual(len(mid_empty.calls), 3)
+
+    def test_hostile_runtime_error_from_read_returns_io_error(self):
+        stream = ShortChunkStream(png(), read_error=RuntimeError("boom on read"))
+        result = validate_file_obj(stream, filename="image.png", content_type="image/png")
+        self.assertFalse(result.allowed)
+        self.assertTrue(has_finding(result, "FILECAGE_IO_ERROR"))
+
+    def test_hostile_runtime_error_from_seekable_returns_io_error(self):
+        stream = ShortChunkStream(png(), chunk_sizes=(4,), seekable_error=RuntimeError("boom on seekable"))
+        result = validate_file_obj(
+            stream,
+            filename="image.png",
+            content_type="image/png",
+            policy={"max_bytes": len(png()) + 64},
+        )
+        self.assertFalse(result.allowed)
+        self.assertTrue(has_finding(result, "FILECAGE_IO_ERROR"))
+
+    def test_keyboard_interrupt_and_system_exit_are_not_swallowed(self):
+        for exc_type in (KeyboardInterrupt, SystemExit):
+            read_stream = ShortChunkStream(png(), read_error=exc_type())
+            with self.assertRaises(exc_type):
+                validate_file_obj(read_stream, filename="image.png", content_type="image/png")
+
+            seekable_stream = ShortChunkStream(png(), chunk_sizes=(4,), seekable_error=exc_type())
+            with self.assertRaises(exc_type):
+                validate_file_obj(
+                    seekable_stream,
+                    filename="image.png",
+                    content_type="image/png",
+                    policy={"max_bytes": len(png()) + 64},
+                )
 
 
 class PathValidationTest(unittest.TestCase):

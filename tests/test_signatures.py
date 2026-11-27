@@ -345,5 +345,26 @@ class StableResultTest(unittest.TestCase):
         self.assertTrue(all(code.startswith("FILECAGE_") for code in (item.code for item in result.findings)))
 
 
+
+class Zip64StructureTest(unittest.TestCase):
+    def test_zip64_macro_ooxml_is_detected_as_executable_docm(self):
+        import io
+        import zipfile
+        from helpers import zip64_central_only_zip
+        names = ["[Content_Types].xml", "word/document.xml", "word/vbaProject.bin"]
+        data = zip64_central_only_zip(names)
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            self.assertEqual(archive.namelist(), names)
+        result = sniff_file_type(data)
+        self.assertEqual(result.format, "docm")
+        self.assertTrue(result.executable)
+
+    def test_zip64_nonmacro_ooxml_is_detected_as_docx(self):
+        from helpers import zip64_central_only_zip
+        result = sniff_file_type(zip64_central_only_zip(["[Content_Types].xml", "word/document.xml"]))
+        self.assertEqual(result.format, "docx")
+        self.assertFalse(result.executable)
+
+
 if __name__ == "__main__":
     unittest.main()

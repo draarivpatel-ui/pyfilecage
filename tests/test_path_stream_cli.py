@@ -361,5 +361,16 @@ class ParseArgsMatrixTest(unittest.TestCase):
     pass
 
 
+
+class HostileStreamFailureTest(unittest.TestCase):
+    def test_runtime_error_from_stream_fails_closed_as_io_error(self):
+        class EvilStream:
+            def read(self, size):
+                raise RuntimeError("hostile stream failure")
+        result = validate_file_obj(EvilStream(), filename="image.png", content_type="image/png")
+        self.assertFalse(result.allowed)
+        self.assertTrue(has_finding(result, "FILECAGE_IO_ERROR"))
+
+
 if __name__ == "__main__":
     unittest.main()

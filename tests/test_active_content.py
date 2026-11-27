@@ -371,5 +371,90 @@ class ScanningPolicyTest(unittest.TestCase):
         self.assertFalse(any(getattr(item, "pattern", None) == "script-tag" for item in result.findings))
 
 
+
+class ProcessingInstructionSvgTest(unittest.TestCase):
+    def test_namespaced_svg_after_processing_instruction_is_not_plain_text(self):
+        from pyfilecage import inspect_file_bytes, sniff_file_type
+        data = ascii_bytes('<?pi version="1"?><x:svg xmlns:x="http://www.w3.org/2000/svg"><x:script>alert(1)</x:script></x:svg>')
+        self.assertEqual(sniff_file_type(data).format, "svg")
+        result = inspect_file_bytes(data)
+        self.assertFalse(result.allowed)
+        self.assertTrue(has_finding(result, "FILECAGE_SVG_ACTIVE_CONTENT"))
+
+    def test_remote_namespaced_svg_after_processing_instruction_is_scanned(self):
+        from pyfilecage import inspect_file_bytes
+        data = ascii_bytes('<?pi?><x:svg xmlns:x="http://www.w3.org/2000/svg"><x:use href="https://example.invalid/x.svg"/></x:svg>')
+        result = inspect_file_bytes(data)
+        self.assertTrue(has_finding(result, "FILECAGE_SVG_ACTIVE_CONTENT"))
+
+    def test_many_processing_instructions_cannot_hide_svg_root(self):
+        from pyfilecage import inspect_file_bytes, sniff_file_type
+        data = ascii_bytes('<?pi?>' * 100 + '<x:svg xmlns:x="http://www.w3.org/2000/svg"><x:script>alert(1)</x:script></x:svg>')
+        self.assertEqual(sniff_file_type(data).format, "svg")
+        self.assertTrue(has_finding(inspect_file_bytes(data), "FILECAGE_SVG_ACTIVE_CONTENT"))
+
+
+class PdfStreamLexicalTest(unittest.TestCase):
+    def custom_stream_pdf(self, payload, type_name="/ObjStm", filter_name="/FlateDecode", padding=b"", prefix=b""):
+        compressed = zlib.compress(ascii_bytes(payload))
+        dictionary = ascii_bytes("<< /Type " + type_name + " /N 1 /First 0 /Filter " + filter_name + " /Length " + str(len(compressed)) + " ") + padding + b">>"
+        return concat_bytes(
+            ascii_bytes("%PDF-1.7\n"), prefix,
+            ascii_bytes("1 0 obj\n"), dictionary,
+            ascii_bytes("\nstream\n"), compressed,
+            ascii_bytes("\nendstream\nendobj\n%%EOF\n"),
+        )
+
+    def test_hex_escaped_object_stream_and_filter_names_are_scanned(self):
+        data = self.custom_stream_pdf("/Type /OpenAction /S /JavaScript /JS (alert(1))", "/Obj#53tm", "/Fl#61teDecode")
+        result = validate_pdf(data)
+        self.assertTrue(any(getattr(item, "token", None) == "/JAVASCRIPT" for item in result.findings))
+
+    def test_long_stream_dictionary_cannot_hide_compressed_actions(self):
+        padding = b"/A " + b"0" * 5000 + b" "
+        data = self.custom_stream_pdf("/Type /Action /S /Launch", padding=padding)
+        result = validate_pdf(data)
+        self.assertTrue(any(getattr(item, "token", None) == "/LAUNCH" for item in result.findings))
+
+    def test_fake_stream_word_in_comment_cannot_skip_real_stream(self):
+        data = self.custom_stream_pdf("/Type /OpenAction /S /JavaScript /JS (alert(1))", prefix=ascii_bytes("% stream\n"))
+        result = validate_pdf(data)
+        self.assertTrue(any(getattr(item, "token", None) == "/JAVASCRIPT" for item in result.findings))
+
+
+class ImagePdfPolyglotTest(unittest.TestCase):
+    def test_clean_jpeg_pdf_polyglot_is_rejected(self):
+        data = concat_bytes(jpeg(), ascii_bytes("\n%PDF-1.7\n%%EOF\n"))
+        result = validate(data, "photo.jpg", "image/jpeg")
+        self.assertTrue(any(item.code == "FILECAGE_POLYGLOT" and getattr(item, "pattern", None) == "pdf-signature" for item in result.findings))
+
+    def test_clean_gif_pdf_polyglot_is_rejected(self):
+        data = concat_bytes(gif(), ascii_bytes("\n%PDF-1.7\n%%EOF\n"))
+        result = validate(data, "image.gif", "image/gif")
+        self.assertTrue(any(item.code == "FILECAGE_POLYGLOT" and getattr(item, "pattern", None) == "pdf-signature" for item in result.findings))
+
+
+class PngCompressedTextLimitTest(unittest.TestCase):
+    def hidden_after_cap_png(self, chunk_type):
+        plain = (b"A" * (1024 * 1024)) + b"<script>alert(1)</script>"
+        compressed = zlib.compress(plain)
+        from helpers import insert_before_png_iend, png_chunk
+        if chunk_type == "zTXt":
+            payload = b"comment\x00\x00" + compressed
+        else:
+            payload = b"comment\x00\x01\x00\x00\x00" + compressed
+        return insert_before_png_iend(png(), png_chunk(chunk_type, payload))
+
+    def test_ztxt_cap_fails_closed_instead_of_scanning_partial_output(self):
+        result = validate(self.hidden_after_cap_png("zTXt"), "image.png", "image/png")
+        self.assertFalse(result.allowed)
+        self.assertTrue(has_finding(result, "FILECAGE_PNG_TEXT_SCAN_LIMIT"))
+
+    def test_itxt_cap_fails_closed_instead_of_scanning_partial_output(self):
+        result = validate(self.hidden_after_cap_png("iTXt"), "image.png", "image/png")
+        self.assertFalse(result.allowed)
+        self.assertTrue(has_finding(result, "FILECAGE_PNG_TEXT_SCAN_LIMIT"))
+
+
 if __name__ == "__main__":
     unittest.main()

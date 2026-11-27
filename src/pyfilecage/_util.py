@@ -1,6 +1,7 @@
 """Internal byte and ASCII helpers."""
 from __future__ import annotations
 
+import re
 from typing import Iterable, List, Sequence, Tuple
 
 from .errors import invalid_input
@@ -59,6 +60,15 @@ def u32be(data: bytes, offset: int) -> int:
     return ((data[offset] << 24) | (data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3])
 
 
+def u64le(data: bytes, offset: int) -> int:
+    if offset < 0 or offset + 8 > len(data):
+        return -1
+    value = 0
+    for index in range(8):
+        value |= data[offset + index] << (index * 8)
+    return value
+
+
 def ascii_lower_byte(value: int) -> int:
     return value + 32 if 65 <= value <= 90 else value
 
@@ -72,19 +82,13 @@ def index_of_bytes(data: bytes, needle: bytes, start: int = 0) -> int:
 def index_of_ascii_fold(data: bytes, needle: str, start: int = 0) -> int:
     if not needle or start >= len(data):
         return -1
-    values = [ascii_lower_byte(ord(char)) for char in needle]
-    end = len(data) - len(values)
-    for index in range(max(0, start), end + 1):
-        if ascii_lower_byte(data[index]) != values[0]:
-            continue
-        matched = True
-        for needle_index in range(1, len(values)):
-            if ascii_lower_byte(data[index + needle_index]) != values[needle_index]:
-                matched = False
-                break
-        if matched:
-            return index
-    return -1
+    try:
+        raw_needle = needle.encode("latin-1")
+    except UnicodeEncodeError:
+        return -1
+    compiled = re.compile(re.escape(raw_needle), re.IGNORECASE)
+    match = compiled.search(data, max(0, start))
+    return -1 if match is None else match.start()
 
 
 class AsciiPattern:
@@ -101,25 +105,17 @@ def define_pattern(pattern_id: str, text: str) -> AsciiPattern:
 
 
 def scan_ascii_patterns(data: bytes, patterns: Sequence[AsciiPattern], start: int = 0):
-    first_map = {}
-    for pattern in patterns:
-        first = ascii_lower_byte(ord(pattern.lower[0]))
-        first_map.setdefault(first, []).append(pattern)
-    found = {}
-    for index in range(max(0, start), len(data)):
-        candidates = first_map.get(ascii_lower_byte(data[index]))
-        if not candidates:
+    if not patterns or start >= len(data):
+        return []
+    folded_data = data.lower()
+    found = []
+    for pattern_index, pattern in enumerate(patterns):
+        try:
+            needle = pattern.lower.encode("latin-1")
+        except UnicodeEncodeError:
             continue
-        for pattern in candidates:
-            if pattern.id in found or index + len(pattern.lower) > len(data):
-                continue
-            matched = True
-            for needle_index, char in enumerate(pattern.lower):
-                if ascii_lower_byte(data[index + needle_index]) != ascii_lower_byte(ord(char)):
-                    matched = False
-                    break
-            if matched:
-                found[pattern.id] = (pattern, index)
-        if len(found) == len(patterns):
-            break
-    return list(found.values())
+        index = folded_data.find(needle, max(0, start))
+        if index != -1:
+            found.append((index, pattern_index, pattern))
+    found.sort(key=lambda item: (item[0], item[1]))
+    return [(pattern, index) for index, _pattern_index, pattern in found]

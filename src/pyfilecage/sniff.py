@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import List, Optional
 
-from ._util import ascii_at, ascii_slice, bytes_equal_at, normalize_bytes, u16be, u16le, u32be, u32le
+from ._util import ascii_at, ascii_slice, bytes_equal_at, normalize_bytes, u16be, u16le, u32be, u32le, u64le
 from .models import SniffResult
 
 UNKNOWN_TYPE = SniffResult(
@@ -33,6 +33,26 @@ def zip_entry_names(data: bytes) -> List[str]:
         if normalized not in seen and len(names) < 128:
             seen.add(normalized)
             names.append(normalized)
+
+    def read_central_directory(central_offset: int, central_size: int, total_entries: int, boundary: int) -> None:
+        central_end = central_offset + central_size
+        if central_offset < 0 or central_size < 0 or central_end > boundary or central_end > len(data):
+            return
+        position = central_offset
+        entry_limit = min(total_entries, 128)
+        for _count in range(entry_limit):
+            if position + 46 > len(data) or u32le(data, position) != 0x02014B50:
+                break
+            name_length = u16le(data, position + 28)
+            extra_length = u16le(data, position + 30)
+            comment_length = u16le(data, position + 32)
+            end = position + 46 + name_length + extra_length + comment_length
+            if name_length <= 0 or end > len(data) or end > central_end:
+                break
+            add_name(ascii_slice(data, position + 46, position + 46 + name_length))
+            if end <= position:
+                break
+            position = end
 
     position = 0
     for _entry_count in range(64):
@@ -69,30 +89,36 @@ def zip_entry_names(data: bytes) -> List[str]:
         total_entries = u16le(data, eocd_position + 10)
         central_size = u32le(data, eocd_position + 12)
         central_offset = u32le(data, eocd_position + 16)
-        central_end = central_offset + central_size
-        if (
-            disk_number == 0
-            and central_disk == 0
-            and entries_on_disk == total_entries
-            and central_offset >= 0
-            and central_size >= 0
-            and central_end <= eocd_position
-        ):
-            position = central_offset
-            entry_limit = min(total_entries, 128)
-            for _count in range(entry_limit):
-                if position + 46 > len(data) or u32le(data, position) != 0x02014B50:
-                    break
-                name_length = u16le(data, position + 28)
-                extra_length = u16le(data, position + 30)
-                comment_length = u16le(data, position + 32)
-                end = position + 46 + name_length + extra_length + comment_length
-                if name_length <= 0 or end > len(data) or end > central_end:
-                    break
-                add_name(ascii_slice(data, position + 46, position + 46 + name_length))
-                if end <= position:
-                    break
-                position = end
+        if disk_number == 0 and central_disk == 0 and entries_on_disk == total_entries:
+            read_central_directory(central_offset, central_size, total_entries, eocd_position)
+
+        locator_position = eocd_position - 20
+        if locator_position >= 0 and u32le(data, locator_position) == 0x07064B50:
+            locator_disk = u32le(data, locator_position + 4)
+            zip64_offset = u64le(data, locator_position + 8)
+            total_disks = u32le(data, locator_position + 16)
+            if (
+                locator_disk == 0
+                and total_disks == 1
+                and zip64_offset >= 0
+                and zip64_offset + 56 <= locator_position
+                and u32le(data, zip64_offset) == 0x06064B50
+            ):
+                record_size = u64le(data, zip64_offset + 4)
+                record_end = zip64_offset + 12 + record_size
+                if record_size >= 44 and record_end == locator_position:
+                    zip64_disk = u32le(data, zip64_offset + 16)
+                    zip64_central_disk = u32le(data, zip64_offset + 20)
+                    zip64_entries_on_disk = u64le(data, zip64_offset + 24)
+                    zip64_total_entries = u64le(data, zip64_offset + 32)
+                    zip64_central_size = u64le(data, zip64_offset + 40)
+                    zip64_central_offset = u64le(data, zip64_offset + 48)
+                    if (
+                        zip64_disk == 0
+                        and zip64_central_disk == 0
+                        and zip64_entries_on_disk == zip64_total_entries
+                    ):
+                        read_central_directory(zip64_central_offset, zip64_central_size, zip64_total_entries, zip64_offset)
     return names
 
 
@@ -347,34 +373,37 @@ def looks_like_csv(text: str) -> bool:
 
 
 def first_element_tag_name(lower_text: str) -> Optional[str]:
-    rest = lower_text.lstrip()
-    for _steps in range(32):
-        if rest.startswith("<?xml"):
-            end = rest.find("?>")
+    position = 0
+    length = len(lower_text)
+    while position < length:
+        while position < length and lower_text[position].isspace():
+            position += 1
+        if lower_text.startswith("<?", position):
+            end = lower_text.find("?>", position + 2)
             if end == -1:
                 return None
-            rest = rest[end + 2:].lstrip()
+            position = end + 2
             continue
-        if rest.startswith("<!--"):
-            end = rest.find("-->")
+        if lower_text.startswith("<!--", position):
+            end = lower_text.find("-->", position + 4)
             if end == -1:
                 return None
-            rest = rest[end + 3:].lstrip()
+            position = end + 3
             continue
-        if rest.startswith("<!doctype"):
-            bracket = rest.find("[")
-            greater = rest.find(">")
+        if lower_text.startswith("<!doctype", position):
+            bracket = lower_text.find("[", position)
+            greater = lower_text.find(">", position)
             if bracket != -1 and greater != -1 and bracket < greater:
-                end = rest.find("]>")
+                end = lower_text.find("]>", position)
                 step = 2
             else:
                 end = greater
                 step = 1
             if end == -1:
                 return None
-            rest = rest[end + step:].lstrip()
+            position = end + step
             continue
-        match = re.match(r"^<\s*([a-z_][a-z0-9_.:-]*)", rest)
+        match = re.match(r"<\s*([a-z_][a-z0-9_.:-]*)", lower_text[position:])
         return match.group(1) if match else None
     return None
 

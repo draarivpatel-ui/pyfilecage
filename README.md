@@ -9,8 +9,8 @@ rejects executable and active content, detects common polyglots, and produces a
 safe storage filename.
 
 The package has no runtime dependencies and does not use `libmagic`, Pillow,
-a subprocess, or a native image decoder. The source checkout contains more than
-700 deterministic stdlib `unittest` tests.
+a subprocess, or a native image decoder. The source checkout contains 806 deterministic
+stdlib `unittest` tests.
 
 ## Publication status
 
@@ -48,19 +48,19 @@ file is harmless in every possible viewer.
 | Attack | CWE | Defense |
 | --- | --- | --- |
 | Executable or script uploaded with an image extension and image MIME type | CWE-434 | Magic-byte detection identifies ELF, PE, thin and universal Mach-O, Java class, WASM, and direct or obfuscated shebang content and blocks it by default. |
-| Macro-enabled Office files renamed as ordinary OOXML documents | CWE-434 | ZIP entry metadata distinguishes DOCX, XLSX, and PPTX from DOCM, XLSM, and PPTM files containing `vbaProject.bin`. Macro-bearing files are executable by default. |
+| Macro-enabled Office files renamed as ordinary OOXML documents | CWE-434 | ZIP and ZIP64 entry metadata distinguishes DOCX, XLSX, and PPTX from DOCM, XLSM, and PPTM files containing `vbaProject.bin`, including uppercase and central-directory-only forms. Macro-bearing files are executable by default. |
 | MIME spoofing through a caller-controlled `Content-Type` header | CWE-434 | The claimed type is stripped of parameters and compared with the verified type. Mismatches reject the upload. |
 | Extension spoofing such as `avatar.png` containing JPEG or executable bytes | CWE-434 | The filename extension is compared with the verified type using explicit alias groups. |
-| RTLO right-to-left override names such as `report U+202E gnp.exe` | CWE-434 | Unicode bidi controls are rejected and removed by the sanitizer. |
+| RTLO right-to-left override names such as `report U+202E gnp.exe` | CWE-434 | Unicode bidi controls and invisible Unicode format characters are rejected and removed by the sanitizer. |
 | Path traversal through slash, backslash, dot, or empty filenames | CWE-22 | Path separators are never preserved. Dot aliases, dotfiles, empty names, controls, NUL, trailing dots, and trailing spaces are rejected by default. |
 | Windows device names such as `CON`, `NUL`, `COM1`, `LPT1`, and superscript variants | CWE-22 | Reserved names are detected case-insensitively after Unicode compatibility normalization and neutralized. |
 | Windows drive syntax and NTFS alternate data stream syntax | CWE-22 | Colons are never preserved and are replaced before a storage name is returned. |
 | Double-extension attacks such as `invoice.pdf.exe` or `avatar.png.php` | CWE-434 | Active final extensions after a plausible document or image extension are flagged and normalized, including forms hidden by trailing punctuation. |
-| GIFAR, JPEG plus ZIP, and similar image archive polyglots | CWE-434 | Raster images are scanned for ZIP local-header and end-of-central-directory signatures. PNG trailing bytes after IEND reject the file. |
-| Active payloads hidden in compressed PNG text chunks | CWE-434 | PNG `zTXt` and compressed `iTXt` chunks are inflated with a strict 1 MiB output cap per chunk and scanned for markup and server-side code. |
+| GIFAR, JPEG plus ZIP, image plus PDF, and similar image archive polyglots | CWE-434 | Raster images are scanned for ZIP local-header and end-of-central-directory signatures and for an embedded PDF header. PNG trailing bytes after IEND reject the file. |
+| Active payloads hidden in compressed PNG text chunks | CWE-434 | PNG `zTXt` and compressed `iTXt` chunks are inflated with a strict 1 MiB output cap per chunk and scanned for markup and server-side code. Reaching that cap fails closed instead of trusting a partial scan. |
 | SVG script execution, event handlers, active hrefs, animated href assignment, `foreignObject`, remote resource references, stylesheet processing instructions, and CSS network access | CWE-79 | SVG is blocked by default. Explicit opt-in still requires the XML-aware active-content scan to pass. |
 | SVG XML external entities and entity declarations | CWE-611 | DOCTYPE and ENTITY declarations reject the upload. |
-| PDF JavaScript, launch actions, automatic actions, singular or plural embedded-file names, and URI actions | CWE-434 | PDF headers are accepted at the specification-permitted offset within the first 1024 bytes. PDF names are decoded, including hex-escaped names such as `/J#61vaScript`. Bounded Flate object streams are inflated and scanned. |
+| PDF JavaScript, launch actions, automatic actions, singular or plural embedded-file names, and URI actions | CWE-434 | PDF headers are accepted at the specification-permitted offset within the first 1024 bytes. PDF names are decoded, including hex-escaped names such as `/J#61vaScript`. Bounded Flate stream scanning does not trust fixed-size dictionary windows and cannot be skipped by decoy uses of the word `stream`. |
 | PNG, JPEG, GIF, WebP, and BMP pixel floods and decompression bombs | CWE-400 | Width, height, and total pixels are read from binary headers and capped before any image decoder is invoked. Defaults are 10000 x 10000 and 25,000,000 pixels. |
 | Malformed JPEG marker loops and truncated image headers | CWE-400 | The marker walker is iterative, bounded, monotonic, and rejects impossible lengths. |
 | Unknown binary content | CWE-434 | Strict UTF-8 and magic-byte detection fail closed unless unknown types are explicitly enabled. |
@@ -266,7 +266,7 @@ HEIF, TIFF little-endian and big-endian, PDF, ZIP, DOCX, XLSX, PPTX, macro-beari
 DOCM, XLSM, and PPTM, JAR, GZIP, ZSTD, TAR, MP3, MP4, QuickTime, OGG, WAV,
 FLAC, WebM, Matroska, WASM, ELF, PE or DOS executables, Mach-O, Java class
 files, shebang scripts, HTML, SVG, XML, strict UTF-8 plain text, JSON, and
-consistent-column CSV.
+consistent-column CSV. Leading XML processing instructions do not hide an SVG or XML root element.
 
 ### `inspect_image_dimensions(data)`
 
@@ -356,9 +356,10 @@ report for a clean name and raises `FileCageError` for hostile input.
 | `FILECAGE_TRAILING_DATA` | PNG contains bytes after IEND. |
 | `FILECAGE_PDF_ACTIVE_CONTENT` | PDF contains an active action or embedded-file name. |
 | `FILECAGE_PDF_SCAN_LIMIT` | Bounded PDF compressed-object scan reached a safety limit or malformed stream. |
+| `FILECAGE_PNG_TEXT_SCAN_LIMIT` | Compressed PNG text scan reached a safety limit or malformed stream. |
 | `FILECAGE_SVG_ACTIVE_CONTENT` | SVG contains script, events, active hrefs, remote references, or network-capable CSS. |
 | `FILECAGE_SVG_XXE` | SVG contains DOCTYPE or ENTITY declarations. |
-| `FILECAGE_FILENAME_*` | Filename is empty, relative, too long, controlled, bidi-spoofed, path-bearing, unsafe, reserved, trailing-normalized, or double-extended. |
+| `FILECAGE_FILENAME_*` | Filename is empty, relative, too long, controlled, bidi-spoofed, format-spoofed, path-bearing, unsafe, reserved, trailing-normalized, or double-extended. |
 | `FILECAGE_PATH_UNSAFE` | Path contains a NUL byte. |
 | `FILECAGE_PATH_SYMLINK` | Path is a symbolic link. |
 | `FILECAGE_PATH_NOT_REGULAR` | Path is not a regular file. |

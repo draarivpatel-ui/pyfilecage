@@ -122,7 +122,7 @@ def parse_bmp_dimensions(data: bytes) -> Optional[ImageDimensions]:
     if dib_size == 12:
         return _make_dimensions("bmp", u16le(data, 18), u16le(data, 20))
     if dib_size >= 40:
-        if len(data) < 26:
+        if len(data) < 14 + dib_size:
             return None
         width = _signed32(u32le(data, 18))
         height = _signed32(u32le(data, 22))

@@ -290,5 +290,20 @@ class FilenameMiscTest(unittest.TestCase):
         self.assertNotIn("\ufffd", report.filename)
 
 
+
+FORMAT_CONTROL_CASES = [("format U+{:04X}".format(value), "a" + chr(value) + "b.png") for value in (0x00AD, 0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF)]
+
+
+def _format_filename_body(self, label, name):
+    report = sanitize_filename(name)
+    self.assertIn("FILECAGE_FILENAME_FORMAT", codes(name), label)
+    self.assertEqual(report.filename, "ab.png", label)
+
+
+@case_methods("filename_format_control", FORMAT_CONTROL_CASES, _format_filename_body)
+class FilenameFormatControlTest(unittest.TestCase):
+    pass
+
+
 if __name__ == "__main__":
     unittest.main()

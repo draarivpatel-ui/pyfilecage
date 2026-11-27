@@ -158,6 +158,7 @@ BMP_INVALID_CASES = [
     ("zero height", bmp(5, 0)),
     ("negative width", bmp(0x80000001, 5)),
     ("unsupported DIB size", b"BM" + bytes(12) + (1).to_bytes(4, "little") + bytes(10)),
+    ("truncated BITMAPINFOHEADER", bmp(5, 5)[:26]),
     ("int-min top-down height rejected", bmp(5, -2147483648)),
 ]
 

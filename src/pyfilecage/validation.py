@@ -470,7 +470,7 @@ def validate_file_obj(stream: Any, filename: str = "", content_type: Optional[st
             total += len(chunk_bytes)
             if len(chunk_bytes) < remaining and hasattr(stream, "seekable") and not stream.seekable():
                 continue
-    except (OSError, TypeError, ValueError):
+    except Exception:
         return _io_failure(normalized_policy, "file-like object bytes could not be read")
 
     data = b"".join(chunks)

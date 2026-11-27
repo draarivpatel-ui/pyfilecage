@@ -35,8 +35,9 @@ def _is_hex_digit(value: int) -> bool:
     return (48 <= value <= 57) or (65 <= value <= 70) or (97 <= value <= 102)
 
 
-def collect_pdf_names(data: bytes, names: set) -> None:
-    """Collect PDF names after decoding PDF ``#XX`` hex escapes."""
+def collect_pdf_name_positions(data: bytes) -> List[Tuple[int, str]]:
+    """Collect PDF names and positions after decoding PDF ``#XX`` hex escapes."""
+    found = []
     for index, value in enumerate(data):
         if value != 0x2F:
             continue
@@ -54,7 +55,14 @@ def collect_pdf_names(data: bytes, names: set) -> None:
                 chars.append(chr(byte))
                 cursor += 1
         if chars:
-            names.add("".join(chars).upper())
+            found.append((index, "".join(chars).upper()))
+    return found
+
+
+def collect_pdf_names(data: bytes, names: set) -> None:
+    """Collect PDF names after decoding PDF ``#XX`` hex escapes."""
+    for _position, name in collect_pdf_name_positions(data):
+        names.add(name)
 
 
 def _inflate_capped(data: bytes, cap: int) -> Tuple[bytes, bool]:
@@ -64,43 +72,74 @@ def _inflate_capped(data: bytes, cap: int) -> Tuple[bytes, bool]:
     return output, limited
 
 
-def collect_compressed_pdf_names(data: bytes, names: set) -> bool:
+def collect_compressed_pdf_names(data: bytes, names: set, positions: List[Tuple[int, str]]) -> bool:
+    interesting_positions = sorted(position for position, name in positions if name in ("OBJSTM", "METADATA"))
+    if not interesting_positions:
+        return False
+
+    def likely_interesting_stream(stream_at: int) -> bool:
+        prior = -1
+        for position in interesting_positions:
+            if position >= stream_at:
+                break
+            prior = position
+        if prior == -1:
+            return False
+        between = data[prior:stream_at].lower()
+        return b"endobj" not in between and b"endstream" not in between
+
+    def keyword_not_inside_word(index: int) -> bool:
+        if index <= 0:
+            return True
+        value = data[index - 1]
+        return not ((65 <= value <= 90) or (97 <= value <= 122) or (48 <= value <= 57) or value == 95)
+
     scan_limited = False
     position = 0
     streams = 0
     output_bytes = 0
-    while streams < 64 and output_bytes < 4194304:
+    candidates = 0
+    while streams < 64 and output_bytes < 4194304 and candidates < 1024:
         stream_at = index_of_ascii_fold(data, "stream", position)
         if stream_at == -1:
             break
-        end_at = index_of_ascii_fold(data, "endstream", stream_at + 6)
-        if end_at == -1:
-            break
-        dictionary_start = max(0, stream_at - 2048)
-        dictionary = data[dictionary_start:stream_at].lower()
-        position = end_at + 9
-        object_stream = b"/objstm" in dictionary
-        metadata_stream = b"/metadata" in dictionary
-        flate = b"/flatedecode" in dictionary
-        if not flate or (not object_stream and not metadata_stream):
+        candidates += 1
+        position = stream_at + 6
+        if not keyword_not_inside_word(stream_at):
             continue
         data_start = stream_at + 6
+        valid_stream_keyword = False
         if data_start + 1 < len(data) and data[data_start] == 13 and data[data_start + 1] == 10:
             data_start += 2
+            valid_stream_keyword = True
         elif data_start < len(data) and data[data_start] in (10, 13):
             data_start += 1
-        if data_start >= end_at:
+            valid_stream_keyword = True
+        if not valid_stream_keyword:
             continue
-        streams += 1
+
+        end_at = index_of_ascii_fold(data, "endstream", data_start)
+        if end_at == -1:
+            if likely_interesting_stream(stream_at):
+                scan_limited = True
+            break
+        if data_start >= end_at:
+            if likely_interesting_stream(stream_at):
+                scan_limited = True
+            continue
         try:
             inflated, capped_or_incomplete = _inflate_capped(data[data_start:end_at], 1048576)
-            output_bytes += len(inflated)
-            collect_pdf_names(inflated, names)
-            if capped_or_incomplete:
-                scan_limited = True
         except (zlib.error, ValueError):
+            if likely_interesting_stream(stream_at):
+                scan_limited = True
+            continue
+        streams += 1
+        output_bytes += len(inflated)
+        collect_pdf_names(inflated, names)
+        if capped_or_incomplete:
             scan_limited = True
-    if streams >= 64 or output_bytes >= 4194304:
+        position = end_at + 9
+    if streams >= 64 or output_bytes >= 4194304 or candidates >= 1024:
         scan_limited = True
     return scan_limited
 
@@ -111,8 +150,10 @@ PDF_ACTIVE_NAMES = frozenset(("JAVASCRIPT", "JS", "LAUNCH", "OPENACTION", "AA", 
 def scan_pdf_active_content(data: bytes, policy) -> List[Finding]:
     findings = []
     names = set()
-    collect_pdf_names(data, names)
-    scan_limited = collect_compressed_pdf_names(data, names)
+    positions = collect_pdf_name_positions(data)
+    for _position, name in positions:
+        names.add(name)
+    scan_limited = collect_compressed_pdf_names(data, names, positions)
     for name in sorted(names):
         if name not in PDF_ACTIVE_NAMES:
             continue
@@ -366,14 +407,18 @@ def zero_byte_index(data: bytes, start: int, end: int) -> int:
     return -1
 
 
-def scan_png_compressed_text(data: bytes, patterns: Sequence) -> List[dict]:
+def scan_png_compressed_text(data: bytes, patterns: Sequence) -> Tuple[List[dict], bool]:
     hits = []
+    scan_limited = False
     if not bytes_equal_at(data, 0, b"\x89PNG\r\n\x1a\n"):
-        return hits
+        return hits, scan_limited
     position = 8
     output_bytes = 0
     for _chunks in range(1024):
-        if output_bytes >= 4194304 or position + 12 > len(data):
+        if output_bytes >= 4194304:
+            scan_limited = True
+            break
+        if position + 12 > len(data):
             break
         length = u32be(data, position)
         chunk_type = ascii_at(data, position + 4, 4)
@@ -400,16 +445,20 @@ def scan_png_compressed_text(data: bytes, patterns: Sequence) -> List[dict]:
                         compressed_start = translated_end + 1
             if compressed_start != -1 and compressed_start < data_end:
                 try:
-                    inflated, _limited = _inflate_capped(data[compressed_start:data_end], 1048576)
+                    inflated, limited = _inflate_capped(data[compressed_start:data_end], 1048576)
                     output_bytes += len(inflated)
+                    if limited:
+                        scan_limited = True
                     for pattern, _position in scan_ascii_patterns(inflated, patterns, 0):
                         hits.append({"pattern": pattern, "position": data_start})
                 except (zlib.error, ValueError):
-                    pass
+                    scan_limited = True
         if chunk_type == "IEND":
             break
         position = end
-    return hits
+    if output_bytes >= 4194304:
+        scan_limited = True
+    return hits, scan_limited
 
 
 def find_zip_signature(data: bytes, start: int) -> int:
@@ -445,7 +494,8 @@ def scan_active_and_polyglot(data: bytes, sniffed, policy) -> List[Finding]:
                 "pattern": pattern.id,
             }))
         if sniffed.format == "png":
-            for hit in scan_png_compressed_text(data, patterns):
+            compressed_hits, png_scan_limited = scan_png_compressed_text(data, patterns)
+            for hit in compressed_hits:
                 if hit["pattern"].id in active_patterns:
                     continue
                 active_patterns.add(hit["pattern"].id)
@@ -453,8 +503,13 @@ def scan_active_and_polyglot(data: bytes, sniffed, policy) -> List[Finding]:
                     "position": hit["position"],
                     "pattern": hit["pattern"].id,
                 }))
+            if png_scan_limited:
+                findings.append(make_finding(ERROR["PNG_TEXT_SCAN_LIMIT"], "compressed PNG text scan reached a safety limit or malformed stream"))
 
     if policy.scan_polyglots and sniffed.format in ("png", "jpeg", "gif", "webp", "bmp"):
+        pdf_at = pdf_header_offset(data)
+        if pdf_at != -1:
+            findings.append(make_finding(ERROR["POLYGLOT"], "image contains an embedded PDF signature", {"position": pdf_at, "pattern": "pdf-signature"}))
         zip_at = find_zip_signature(data, 2)
         if zip_at != -1:
             findings.append(make_finding(ERROR["POLYGLOT"], "image contains an embedded ZIP or JAR signature", {"position": zip_at, "pattern": "zip-signature"}))

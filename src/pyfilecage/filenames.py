@@ -33,6 +33,10 @@ def _is_bidi_control_code_point(code_point: int) -> bool:
     )
 
 
+def _is_format_control_code_point(code_point: int) -> bool:
+    return unicodedata.category(chr(code_point)) == "Cf"
+
+
 def _is_surrogate_code_point(code_point: int) -> bool:
     return 0xD800 <= code_point <= 0xDFFF
 
@@ -149,6 +153,8 @@ def sanitize_filename(input_value: str, options: Optional[Mapping[str, Any]] = N
             add(ERROR["FILENAME_CONTROL"], "filename contains a control character", {"position": index})
         elif _is_bidi_control_code_point(code_point):
             add(ERROR["FILENAME_BIDI"], "filename contains a Unicode bidirectional control character", {"position": index})
+        elif _is_format_control_code_point(code_point):
+            add(ERROR["FILENAME_FORMAT"], "filename contains an invisible Unicode format character", {"position": index})
 
     had_path_separator = "/" in normalized or "\\" in normalized
     if had_path_separator:
@@ -179,7 +185,7 @@ def sanitize_filename(input_value: str, options: Optional[Mapping[str, Any]] = N
     unsafe_character = False
     for char in basename:
         code_point = ord(char)
-        if code_point == 0 or _is_control_code_point(code_point) or _is_bidi_control_code_point(code_point):
+        if code_point == 0 or _is_control_code_point(code_point) or _is_bidi_control_code_point(code_point) or _is_format_control_code_point(code_point):
             continue
         if char in WINDOWS_UNSAFE_CHARS or code_point in UNICODE_PATH_SEPARATORS or _is_surrogate_code_point(code_point):
             unsafe_character = True

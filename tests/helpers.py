@@ -38,6 +38,10 @@ def u32le_bytes(value):
     return struct.pack("<I", value & 0xFFFFFFFF)
 
 
+def u64le_bytes(value):
+    return struct.pack("<Q", value & 0xFFFFFFFFFFFFFFFF)
+
+
 def png(width=1, height=1, *, no_ihdr=False, idat=True, iend=True, trailing=b""):
     out = bytearray(b"\x89PNG\r\n\x1a\n")
     if no_ihdr:
@@ -167,6 +171,30 @@ def central_only_zip(names):
         + u32le_bytes(len(central)) + u32le_bytes(len(local)) + u16le_bytes(0)
     )
     return local + central + eocd
+
+
+def zip64_central_only_zip(names):
+    local = (
+        b"PK\x03\x04"
+        + u16le_bytes(45) + u16le_bytes(8) + u16le_bytes(0)
+        + u16le_bytes(0) + u16le_bytes(0) + u32le_bytes(0)
+        + u32le_bytes(0) + u32le_bytes(0) + u16le_bytes(1) + u16le_bytes(0)
+        + ascii_bytes("a")
+    )
+    central = concat_bytes(*(central_entry(name) for name in names))
+    central_offset = len(local)
+    zip64_offset = central_offset + len(central)
+    zip64_eocd = (
+        b"PK\x06\x06" + u64le_bytes(44) + u16le_bytes(45) + u16le_bytes(45)
+        + u32le_bytes(0) + u32le_bytes(0) + u64le_bytes(len(names)) + u64le_bytes(len(names))
+        + u64le_bytes(len(central)) + u64le_bytes(central_offset)
+    )
+    locator = b"PK\x06\x07" + u32le_bytes(0) + u64le_bytes(zip64_offset) + u32le_bytes(1)
+    eocd = (
+        b"PK\x05\x06" + u16le_bytes(0) + u16le_bytes(0) + u16le_bytes(0xFFFF) + u16le_bytes(0xFFFF)
+        + u32le_bytes(0xFFFFFFFF) + u32le_bytes(0xFFFFFFFF) + u16le_bytes(0)
+    )
+    return local + central + zip64_eocd + locator + eocd
 
 
 def ftyp(major="isom", compatible=()):

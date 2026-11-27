@@ -422,6 +422,85 @@ class PdfStreamLexicalTest(unittest.TestCase):
         self.assertTrue(any(getattr(item, "token", None) == "/JAVASCRIPT" for item in result.findings))
 
 
+class PdfReviewRegressionTest(unittest.TestCase):
+    def stream_object(self, number, dictionary_entries, payload, terminator=True):
+        compressed = zlib.compress(payload)
+        end = ascii_bytes("\nendstream") if terminator else b""
+        return concat_bytes(
+            ascii_bytes(str(number) + " 0 obj\n<< " + dictionary_entries + " /Length " + str(len(compressed)) + " >>\nstream\n"),
+            compressed,
+            end,
+        )
+
+    def metadata_pdf(self, content_count=0, large_content=False):
+        parts = [ascii_bytes("%PDF-1.7\n")]
+        parts.append(ascii_bytes("1 0 obj\n<< /Type /Catalog /Metadata 2 0 R >>\nendobj\n"))
+        parts.append(self.stream_object(2, "/Type /Metadata /Subtype /XML /Filter /FlateDecode", b"<x:xmpmeta/>"))
+        if large_content:
+            parts.append(self.stream_object(3, "/Filter /FlateDecode", b"A" * (2 * 1024 * 1024)))
+        for index in range(content_count):
+            parts.append(self.stream_object(10 + index, "/Filter /FlateDecode", b"BT /F1 12 Tf ET"))
+        parts.append(ascii_bytes("\n%%EOF\n"))
+        return concat_bytes(*parts)
+
+    def custom_stream_pdf(self, payload, dictionary_extras="", stream_line=b"stream\n", prefix=b""):
+        compressed = zlib.compress(ascii_bytes(payload) if isinstance(payload, str) else payload)
+        return concat_bytes(
+            ascii_bytes("%PDF-1.7\n"), prefix,
+            ascii_bytes("1 0 obj\n<< /Type /ObjStm /N 1 /First 0 /Filter /FlateDecode " + dictionary_extras + "/Length " + str(len(compressed)) + " >>\n"),
+            stream_line, compressed,
+            ascii_bytes("\nendstream\nendobj\n%%EOF\n"),
+        )
+
+    def test_many_benign_content_streams_do_not_reach_object_scan_limit(self):
+        result = validate_pdf(self.metadata_pdf(content_count=70))
+        self.assertFalse(has_finding(result, "FILECAGE_PDF_SCAN_LIMIT"))
+
+    def test_large_benign_image_stream_does_not_reach_object_scan_limit(self):
+        result = validate_pdf(self.metadata_pdf(large_content=True))
+        self.assertFalse(has_finding(result, "FILECAGE_PDF_SCAN_LIMIT"))
+
+    def test_stream_space_before_line_break_is_scanned(self):
+        data = self.custom_stream_pdf("/Type /OpenAction /S /JavaScript /JS (alert(1))", stream_line=b"stream \n")
+        result = validate_pdf(data)
+        self.assertTrue(any(getattr(item, "token", None) == "/JAVASCRIPT" for item in result.findings))
+
+    def test_literal_endobj_in_dictionary_string_does_not_hide_object_stream(self):
+        data = self.custom_stream_pdf("/Type /OpenAction /S /JavaScript /JS (alert(1))", dictionary_extras="/X (endobj) ")
+        result = validate_pdf(data)
+        self.assertTrue(any(getattr(item, "token", None) == "/JAVASCRIPT" for item in result.findings))
+
+    def test_inflating_comment_decoy_cannot_skip_real_object_stream(self):
+        decoy = ascii_bytes("% stream\n") + zlib.compress(b"hi") + b"\n"
+        data = self.custom_stream_pdf("/Type /OpenAction /S /JavaScript /JS (alert(1))", prefix=decoy)
+        result = validate_pdf(data)
+        self.assertTrue(any(getattr(item, "token", None) == "/JAVASCRIPT" for item in result.findings))
+
+    def test_missing_stream_line_break_fails_closed(self):
+        data = self.custom_stream_pdf("/Type /OpenAction /S /JavaScript /JS (alert(1))", stream_line=b"stream x\n")
+        result = validate_pdf(data)
+        self.assertTrue(has_finding(result, "FILECAGE_PDF_SCAN_LIMIT"))
+
+    def test_concatenated_object_stream_cannot_skip_later_stream(self):
+        first = self.stream_object(1, "/Type /ObjStm /N 1 /First 0 /Filter /FlateDecode", b"inert", terminator=False)
+        second = self.stream_object(2, "/Type /ObjStm /N 1 /First 0 /Filter /FlateDecode", ascii_bytes("/Type /OpenAction /S /JavaScript /JS (alert(1))"))
+        data = concat_bytes(ascii_bytes("%PDF-1.7\n"), first, ascii_bytes("\n"), second, ascii_bytes("\n%%EOF\n"))
+        result = validate_pdf(data)
+        self.assertTrue(has_finding(result, "FILECAGE_PDF_SCAN_LIMIT"))
+
+
+class PngManyChunkRegressionTest(unittest.TestCase):
+    def test_compressed_text_after_more_than_1024_chunks_is_scanned(self):
+        from helpers import png_chunk
+        compressed = zlib.compress(b"<script>alert(1)</script>")
+        chunks = [png_chunk("IDAT", b"") for _index in range(1100)]
+        chunks.append(png_chunk("zTXt", b"comment\x00\x00" + compressed))
+        chunks.append(png_chunk("IEND", b""))
+        data = concat_bytes(png(idat=False, iend=False), *chunks)
+        result = validate(data, "image.png", "image/png")
+        self.assertTrue(has_finding(result, "FILECAGE_ACTIVE_CONTENT"))
+
+
 class ImagePdfPolyglotTest(unittest.TestCase):
     def test_clean_jpeg_pdf_polyglot_is_rejected(self):
         data = concat_bytes(jpeg(), ascii_bytes("\n%PDF-1.7\n%%EOF\n"))

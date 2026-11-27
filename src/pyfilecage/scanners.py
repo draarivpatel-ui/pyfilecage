@@ -72,74 +72,147 @@ def _inflate_capped(data: bytes, cap: int) -> Tuple[bytes, bool]:
     return output, limited
 
 
-def collect_compressed_pdf_names(data: bytes, names: set, positions: List[Tuple[int, str]]) -> bool:
-    interesting_positions = sorted(position for position, name in positions if name in ("OBJSTM", "METADATA"))
-    if not interesting_positions:
+def mask_pdf_nonstructural_data(data: bytes) -> bytes:
+    """Blank PDF comments and string payloads while preserving byte positions."""
+    masked = bytearray(data)
+    index = 0
+    length = len(data)
+    while index < length:
+        value = data[index]
+        if value == 0x25:
+            masked[index] = 32
+            index += 1
+            while index < length and data[index] not in (10, 13):
+                masked[index] = 32
+                index += 1
+            continue
+        if value == 0x28:
+            depth = 1
+            escaped = False
+            masked[index] = 32
+            index += 1
+            while index < length and depth:
+                current = data[index]
+                masked[index] = 32
+                if escaped:
+                    escaped = False
+                elif current == 0x5C:
+                    escaped = True
+                elif current == 0x28:
+                    depth += 1
+                elif current == 0x29:
+                    depth -= 1
+                index += 1
+            continue
+        if value == 0x3C and not (index + 1 < length and data[index + 1] == 0x3C) and not (index > 0 and data[index - 1] == 0x3C):
+            masked[index] = 32
+            index += 1
+            while index < length:
+                current = data[index]
+                masked[index] = 32
+                index += 1
+                if current == 0x3E:
+                    break
+            continue
+        index += 1
+    return bytes(masked)
+
+
+def has_interesting_pdf_stream_type(positions: List[Tuple[int, str]]) -> bool:
+    for index in range(len(positions) - 1):
+        if positions[index][1] == "TYPE" and positions[index + 1][1] in ("OBJSTM", "METADATA"):
+            return True
+    return False
+
+
+PDF_OBJECT_HEADER_RE = re.compile(rb"(?<![0-9])\d+\s+\d+\s+obj(?![A-Za-z0-9_])")
+
+
+def _stream_data_start(data: bytes, stream_at: int) -> Tuple[int, bool]:
+    cursor = stream_at + 6
+    while cursor < len(data) and data[cursor] in (9, 32):
+        cursor += 1
+    if cursor + 1 < len(data) and data[cursor] == 13 and data[cursor + 1] == 10:
+        return cursor + 2, True
+    if cursor < len(data) and data[cursor] in (10, 13):
+        return cursor + 1, True
+    return cursor, False
+
+
+def collect_compressed_pdf_names(data: bytes, names: set) -> bool:
+    object_matches = list(PDF_OBJECT_HEADER_RE.finditer(data))
+    if not object_matches:
         return False
 
-    def likely_interesting_stream(stream_at: int) -> bool:
-        prior = -1
-        for position in interesting_positions:
-            if position >= stream_at:
-                break
-            prior = position
-        if prior == -1:
-            return False
-        between = data[prior:stream_at].lower()
-        return b"endobj" not in between and b"endstream" not in between
-
-    def keyword_not_inside_word(index: int) -> bool:
-        if index <= 0:
-            return True
-        value = data[index - 1]
-        return not ((65 <= value <= 90) or (97 <= value <= 122) or (48 <= value <= 57) or value == 95)
-
     scan_limited = False
-    position = 0
-    streams = 0
+    interesting_streams = 0
     output_bytes = 0
-    candidates = 0
-    while streams < 64 and output_bytes < 4194304 and candidates < 1024:
-        stream_at = index_of_ascii_fold(data, "stream", position)
-        if stream_at == -1:
-            break
-        candidates += 1
-        position = stream_at + 6
-        if not keyword_not_inside_word(stream_at):
+    skip_before = 0
+    for object_index, match in enumerate(object_matches):
+        if match.start() < skip_before or interesting_streams >= 64 or output_bytes >= 4194304:
             continue
-        data_start = stream_at + 6
-        valid_stream_keyword = False
-        if data_start + 1 < len(data) and data[data_start] == 13 and data[data_start + 1] == 10:
-            data_start += 2
-            valid_stream_keyword = True
-        elif data_start < len(data) and data[data_start] in (10, 13):
-            data_start += 1
-            valid_stream_keyword = True
-        if not valid_stream_keyword:
+        body_start = match.end()
+        object_end = object_matches[object_index + 1].start() if object_index + 1 < len(object_matches) else len(data)
+        object_probe = mask_pdf_nonstructural_data(data[body_start:object_end])
+        endobj_relative = index_of_ascii_fold(object_probe, "endobj", 0)
+        if endobj_relative != -1:
+            object_probe = object_probe[:endobj_relative]
+        stream_relative = -1
+        search_at = 0
+        while search_at < len(object_probe):
+            candidate = index_of_ascii_fold(object_probe, "stream", search_at)
+            if candidate == -1:
+                break
+            previous = object_probe[candidate - 1] if candidate > 0 else 32
+            if (65 <= previous <= 90) or (97 <= previous <= 122) or (48 <= previous <= 57) or previous == 95:
+                search_at = candidate + 6
+                continue
+            stream_relative = candidate
+            break
+
+        if stream_relative == -1:
+            if has_interesting_pdf_stream_type(collect_pdf_name_positions(object_probe)):
+                scan_limited = True
             continue
 
+        stream_at = body_start + stream_relative
+        prefix_names = collect_pdf_name_positions(object_probe[:stream_relative])
+        interesting = has_interesting_pdf_stream_type(prefix_names)
+        if not interesting:
+            continue
+
+        data_start, valid_eol = _stream_data_start(data, stream_at)
+        if not valid_eol:
+            scan_limited = True
+            continue
         end_at = index_of_ascii_fold(data, "endstream", data_start)
         if end_at == -1:
-            if likely_interesting_stream(stream_at):
-                scan_limited = True
-            break
+            scan_limited = True
+            continue
         if data_start >= end_at:
-            if likely_interesting_stream(stream_at):
-                scan_limited = True
+            scan_limited = True
+            skip_before = end_at + 9
             continue
+
+        compressed_segment = data[data_start:end_at]
         try:
-            inflated, capped_or_incomplete = _inflate_capped(data[data_start:end_at], 1048576)
+            decompressor = zlib.decompressobj()
+            inflated = decompressor.decompress(compressed_segment, 1048576)
         except (zlib.error, ValueError):
-            if likely_interesting_stream(stream_at):
-                scan_limited = True
+            scan_limited = True
+            skip_before = end_at + 9
             continue
-        streams += 1
+        capped_or_incomplete = bool(decompressor.unconsumed_tail) or not decompressor.eof
+        consumed = len(compressed_segment) - len(decompressor.unconsumed_tail) - len(decompressor.unused_data)
+        trailing = compressed_segment[consumed:]
+        interesting_streams += 1
         output_bytes += len(inflated)
         collect_pdf_names(inflated, names)
-        if capped_or_incomplete:
+        if capped_or_incomplete or trailing.strip(b"\x00\x09\x0a\x0c\x0d\x20"):
             scan_limited = True
-        position = end_at + 9
-    if streams >= 64 or output_bytes >= 4194304 or candidates >= 1024:
+        skip_before = end_at + 9
+
+    if interesting_streams >= 64 or output_bytes >= 4194304:
         scan_limited = True
     return scan_limited
 
@@ -153,7 +226,7 @@ def scan_pdf_active_content(data: bytes, policy) -> List[Finding]:
     positions = collect_pdf_name_positions(data)
     for _position, name in positions:
         names.add(name)
-    scan_limited = collect_compressed_pdf_names(data, names, positions)
+    scan_limited = collect_compressed_pdf_names(data, names)
     for name in sorted(names):
         if name not in PDF_ACTIVE_NAMES:
             continue
@@ -414,7 +487,7 @@ def scan_png_compressed_text(data: bytes, patterns: Sequence) -> Tuple[List[dict
         return hits, scan_limited
     position = 8
     output_bytes = 0
-    for _chunks in range(1024):
+    while True:
         if output_bytes >= 4194304:
             scan_limited = True
             break

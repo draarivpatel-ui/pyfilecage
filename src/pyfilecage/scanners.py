@@ -72,28 +72,39 @@ def _inflate_capped(data: bytes, cap: int) -> Tuple[bytes, bool]:
     return output, limited
 
 
-def mask_pdf_nonstructural_data(data: bytes) -> bytes:
-    """Blank PDF comments and string payloads while preserving byte positions."""
-    masked = bytearray(data)
+def mask_pdf_object_prefix(data: bytes) -> Tuple[bytes, Optional[str], int]:
+    """Mask a stream-object prefix, stopping before a lexical stream/endobj token."""
+    masked = bytearray()
     index = 0
     length = len(data)
+
+    def keyword_at(keyword: bytes) -> bool:
+        if not data[index:index + len(keyword)].lower() == keyword:
+            return False
+        previous = data[index - 1] if index > 0 else 32
+        return not ((65 <= previous <= 90) or (97 <= previous <= 122) or (48 <= previous <= 57) or previous == 95)
+
     while index < length:
+        if keyword_at(b"stream"):
+            return bytes(masked), "stream", index
+        if keyword_at(b"endobj"):
+            return bytes(masked), "endobj", index
         value = data[index]
         if value == 0x25:
-            masked[index] = 32
+            masked.append(32)
             index += 1
             while index < length and data[index] not in (10, 13):
-                masked[index] = 32
+                masked.append(32)
                 index += 1
             continue
         if value == 0x28:
             depth = 1
             escaped = False
-            masked[index] = 32
+            masked.append(32)
             index += 1
             while index < length and depth:
                 current = data[index]
-                masked[index] = 32
+                masked.append(32)
                 if escaped:
                     escaped = False
                 elif current == 0x5C:
@@ -105,17 +116,18 @@ def mask_pdf_nonstructural_data(data: bytes) -> bytes:
                 index += 1
             continue
         if value == 0x3C and not (index + 1 < length and data[index + 1] == 0x3C) and not (index > 0 and data[index - 1] == 0x3C):
-            masked[index] = 32
+            masked.append(32)
             index += 1
             while index < length:
                 current = data[index]
-                masked[index] = 32
+                masked.append(32)
                 index += 1
                 if current == 0x3E:
                     break
             continue
+        masked.append(value)
         index += 1
-    return bytes(masked)
+    return bytes(masked), None, length
 
 
 def has_interesting_pdf_stream_type(positions: List[Tuple[int, str]]) -> bool:
@@ -125,7 +137,8 @@ def has_interesting_pdf_stream_type(positions: List[Tuple[int, str]]) -> bool:
     return False
 
 
-PDF_OBJECT_HEADER_RE = re.compile(rb"(?<![0-9])\d+\s+\d+\s+obj(?![A-Za-z0-9_])")
+PDF_OBJECT_SEPARATOR = rb"(?:[\x00\t\n\x0c\r ]|%[^\r\n]*(?:\r\n|\r|\n))+"
+PDF_OBJECT_HEADER_RE = re.compile(rb"(?<![0-9])\d+" + PDF_OBJECT_SEPARATOR + rb"\d+" + PDF_OBJECT_SEPARATOR + rb"obj(?![A-Za-z0-9_])")
 
 
 def _stream_data_start(data: bytes, stream_at: int) -> Tuple[int, bool]:
@@ -142,7 +155,7 @@ def _stream_data_start(data: bytes, stream_at: int) -> Tuple[int, bool]:
 def collect_compressed_pdf_names(data: bytes, names: set) -> bool:
     object_matches = list(PDF_OBJECT_HEADER_RE.finditer(data))
     if not object_matches:
-        return False
+        return index_of_ascii_fold(data, "stream", 0) != -1
 
     scan_limited = False
     interesting_streams = 0
@@ -153,25 +166,14 @@ def collect_compressed_pdf_names(data: bytes, names: set) -> bool:
             continue
         body_start = match.end()
         object_end = object_matches[object_index + 1].start() if object_index + 1 < len(object_matches) else len(data)
-        object_probe = mask_pdf_nonstructural_data(data[body_start:object_end])
-        endobj_relative = index_of_ascii_fold(object_probe, "endobj", 0)
-        if endobj_relative != -1:
-            object_probe = object_probe[:endobj_relative]
-        stream_relative = -1
-        search_at = 0
-        while search_at < len(object_probe):
-            candidate = index_of_ascii_fold(object_probe, "stream", search_at)
-            if candidate == -1:
-                break
-            previous = object_probe[candidate - 1] if candidate > 0 else 32
-            if (65 <= previous <= 90) or (97 <= previous <= 122) or (48 <= previous <= 57) or previous == 95:
-                search_at = candidate + 6
-                continue
-            stream_relative = candidate
-            break
+        object_probe, terminator, terminator_relative = mask_pdf_object_prefix(data[body_start:object_end])
+        endobj_relative = terminator_relative if terminator == "endobj" else -1
+        stream_relative = terminator_relative if terminator == "stream" else -1
 
         if stream_relative == -1:
-            if has_interesting_pdf_stream_type(collect_pdf_name_positions(object_probe)):
+            if endobj_relative == -1 and object_index + 1 < len(object_matches):
+                scan_limited = True
+            elif has_interesting_pdf_stream_type(collect_pdf_name_positions(object_probe)):
                 scan_limited = True
             continue
 
@@ -179,6 +181,8 @@ def collect_compressed_pdf_names(data: bytes, names: set) -> bool:
         prefix_names = collect_pdf_name_positions(object_probe[:stream_relative])
         interesting = has_interesting_pdf_stream_type(prefix_names)
         if not interesting:
+            continue
+        if not any(name == "FILTER" for _pos, name in prefix_names):
             continue
 
         data_start, valid_eol = _stream_data_start(data, stream_at)
@@ -457,7 +461,7 @@ def png_logical_end(data: bytes) -> int:
     if not bytes_equal_at(data, 0, b"\x89PNG\r\n\x1a\n"):
         return -1
     position = 8
-    for _chunks in range(1024):
+    while True:
         if position + 12 > len(data):
             return -1
         length = u32be(data, position)
@@ -470,7 +474,6 @@ def png_logical_end(data: bytes) -> int:
         if chunk_type == "IEND":
             return end
         position = end
-    return -1
 
 
 def zero_byte_index(data: bytes, start: int, end: int) -> int:

@@ -9,7 +9,7 @@ rejects executable and active content, detects common polyglots, and produces a
 safe storage filename.
 
 The package has no runtime dependencies and does not use `libmagic`, Pillow,
-a subprocess, or a native image decoder. The source checkout contains 814 deterministic
+a subprocess, or a native image decoder. The source checkout contains 820 deterministic
 stdlib `unittest` tests.
 
 ## Publication status

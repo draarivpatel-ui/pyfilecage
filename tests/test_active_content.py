@@ -489,6 +489,53 @@ class PdfReviewRegressionTest(unittest.TestCase):
         self.assertTrue(has_finding(result, "FILECAGE_PDF_SCAN_LIMIT"))
 
 
+    def test_comment_fake_object_header_fails_closed(self):
+        compressed = zlib.compress(b"/S /JavaScript /JS (alert(1))")
+        data = concat_bytes(
+            ascii_bytes("%PDF-1.7\n5 0 obj\n<< /Type %9 0 obj\n/ObjStm /N 1 /First 0 /Filter /FlateDecode /Length " + str(len(compressed)) + " >>\nstream\n"),
+            compressed,
+            ascii_bytes("\nendstream\nendobj\n%%EOF\n"),
+        )
+        result = validate_pdf(data)
+        self.assertTrue(has_finding(result, "FILECAGE_PDF_SCAN_LIMIT"))
+
+    def test_nul_whitespace_object_header_is_recognized(self):
+        compressed = zlib.compress(b"/S /JavaScript /JS (alert(1))")
+        data = concat_bytes(
+            b"%PDF-1.7\n5\x000\x00obj\n<< /Type /ObjStm /N 1 /First 0 /Filter /FlateDecode /Length " + str(len(compressed)).encode() + b" >>\nstream\n",
+            compressed,
+            b"\nendstream\nendobj\n%%EOF\n",
+        )
+        result = validate_pdf(data)
+        self.assertTrue(any(getattr(item, "token", None) == "/JAVASCRIPT" for item in result.findings))
+
+    def test_comment_inside_object_header_is_recognized(self):
+        compressed = zlib.compress(b"/S /JavaScript /JS (alert(1))")
+        data = concat_bytes(
+            b"%PDF-1.7\n5 0 %c\nobj\n<< /Type /ObjStm /N 1 /First 0 /Filter /FlateDecode /Length " + str(len(compressed)).encode() + b" >>\nstream\n",
+            compressed,
+            b"\nendstream\nendobj\n%%EOF\n",
+        )
+        result = validate_pdf(data)
+        self.assertTrue(any(getattr(item, "token", None) == "/JAVASCRIPT" for item in result.findings))
+
+    def test_uncompressed_xmp_metadata_is_not_scan_limited(self):
+        xml = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF/></x:xmpmeta>"
+        data = concat_bytes(
+            ascii_bytes("%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Metadata 2 0 R >>\nendobj\n"),
+            ascii_bytes("2 0 obj\n<< /Type /Metadata /Subtype /XML /Length " + str(len(xml)) + " >>\nstream\n"),
+            xml,
+            ascii_bytes("\nendstream\nendobj\n%%EOF\n"),
+        )
+        result = validate_pdf(data)
+        self.assertFalse(has_finding(result, "FILECAGE_PDF_SCAN_LIMIT"))
+
+    def test_stream_without_any_object_header_fails_closed(self):
+        data = ascii_bytes("%PDF-1.7\nstream\nabc\nendstream\n%%EOF\n")
+        result = validate_pdf(data)
+        self.assertTrue(has_finding(result, "FILECAGE_PDF_SCAN_LIMIT"))
+
+
 class PngManyChunkRegressionTest(unittest.TestCase):
     def test_compressed_text_after_more_than_1024_chunks_is_scanned(self):
         from helpers import png_chunk
@@ -499,6 +546,15 @@ class PngManyChunkRegressionTest(unittest.TestCase):
         data = concat_bytes(png(idat=False, iend=False), *chunks)
         result = validate(data, "image.png", "image/png")
         self.assertTrue(has_finding(result, "FILECAGE_ACTIVE_CONTENT"))
+
+
+    def test_trailing_data_after_more_than_1024_chunks_is_rejected(self):
+        from helpers import png_chunk
+        chunks = [png_chunk("teXt", b"x") for _index in range(1100)]
+        chunks.append(png_chunk("IEND", b""))
+        data = concat_bytes(png(idat=False, iend=False), *chunks, b"TRAILING PAYLOAD")
+        result = validate(data, "image.png", "image/png")
+        self.assertTrue(has_finding(result, "FILECAGE_TRAILING_DATA"))
 
 
 class ImagePdfPolyglotTest(unittest.TestCase):

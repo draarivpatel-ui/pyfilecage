@@ -536,6 +536,41 @@ class PdfReviewRegressionTest(unittest.TestCase):
         self.assertTrue(has_finding(result, "FILECAGE_PDF_SCAN_LIMIT"))
 
 
+    def object_key_bypass_pdf(self, key_text):
+        compressed = zlib.compress(b"/S /JavaScript /JS (alert(1))")
+        return concat_bytes(
+            ascii_bytes("%PDF-1.7\n1 0 obj\n<< " + key_text + " /Type /ObjStm /N 1 /First 0 /Filter /FlateDecode /Length " + str(len(compressed)) + " >>\nstream\n"),
+            compressed,
+            ascii_bytes("\nendstream\nendobj\n%%EOF\n"),
+        )
+
+    def test_stream_name_key_does_not_hide_object_stream(self):
+        result = validate_pdf(self.object_key_bypass_pdf("/Stream 0"))
+        self.assertTrue(any(getattr(item, "token", None) == "/JAVASCRIPT" for item in result.findings))
+
+    def test_endobj_name_key_does_not_hide_object_stream(self):
+        result = validate_pdf(self.object_key_bypass_pdf("/Endobj 0"))
+        self.assertTrue(any(getattr(item, "token", None) == "/JAVASCRIPT" for item in result.findings))
+
+    def test_nested_hex_brackets_do_not_hide_object_stream(self):
+        result = validate_pdf(self.object_key_bypass_pdf("/K <<<endobj>>"))
+        self.assertTrue(any(getattr(item, "token", None) == "/JAVASCRIPT" for item in result.findings) or has_finding(result, "FILECAGE_PDF_SCAN_LIMIT"))
+
+    def test_object_stream_without_type_but_with_first_is_scanned(self):
+        compressed = zlib.compress(b"/S /JavaScript /JS (alert(1))")
+        data = concat_bytes(
+            ascii_bytes("%PDF-1.7\n1 0 obj\n<< /N 1 /First 0 /Filter /FlateDecode /Length " + str(len(compressed)) + " >>\nstream\n"),
+            compressed,
+            ascii_bytes("\nendstream\nendobj\n%%EOF\n"),
+        )
+        result = validate_pdf(data)
+        self.assertTrue(any(getattr(item, "token", None) == "/JAVASCRIPT" for item in result.findings))
+
+    def test_decodeparms_interesting_stream_fails_closed(self):
+        result = validate_pdf(self.object_key_bypass_pdf("/DecodeParms << /Predictor 12 >>"))
+        self.assertTrue(has_finding(result, "FILECAGE_PDF_SCAN_LIMIT"))
+
+
 class PngManyChunkRegressionTest(unittest.TestCase):
     def test_compressed_text_after_more_than_1024_chunks_is_scanned(self):
         from helpers import png_chunk

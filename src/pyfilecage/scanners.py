@@ -82,14 +82,31 @@ def mask_pdf_object_prefix(data: bytes) -> Tuple[bytes, Optional[str], int]:
         if not data[index:index + len(keyword)].lower() == keyword:
             return False
         previous = data[index - 1] if index > 0 else 32
-        return not ((65 <= previous <= 90) or (97 <= previous <= 122) or (48 <= previous <= 57) or previous == 95)
+        if (65 <= previous <= 90) or (97 <= previous <= 122) or (48 <= previous <= 57) or previous == 95:
+            return False
+        after = index + len(keyword)
+        if after >= len(data):
+            return True
+        value_after = data[after]
+        return value_after <= 32 or value_after in (0x25, 0x28, 0x29, 0x3C, 0x3E, 0x5B, 0x5D, 0x7B, 0x7D, 0x2F)
 
     while index < length:
+        value = data[index]
+        if value == 0x2F:
+            masked.append(value)
+            index += 1
+            while index < length:
+                current = data[index]
+                delimiter = current <= 32 or current in (0x25, 0x28, 0x29, 0x3C, 0x3E, 0x5B, 0x5D, 0x7B, 0x7D, 0x2F)
+                if delimiter:
+                    break
+                masked.append(current)
+                index += 1
+            continue
         if keyword_at(b"stream"):
             return bytes(masked), "stream", index
         if keyword_at(b"endobj"):
             return bytes(masked), "endobj", index
-        value = data[index]
         if value == 0x25:
             masked.append(32)
             index += 1
@@ -115,7 +132,15 @@ def mask_pdf_object_prefix(data: bytes) -> Tuple[bytes, Optional[str], int]:
                     depth -= 1
                 index += 1
             continue
-        if value == 0x3C and not (index + 1 < length and data[index + 1] == 0x3C) and not (index > 0 and data[index - 1] == 0x3C):
+        if value == 0x3C and index + 1 < length and data[index + 1] == 0x3C:
+            masked.extend((value, data[index + 1]))
+            index += 2
+            continue
+        if value == 0x3E and index + 1 < length and data[index + 1] == 0x3E:
+            masked.extend((value, data[index + 1]))
+            index += 2
+            continue
+        if value == 0x3C:
             masked.append(32)
             index += 1
             while index < length:
@@ -131,6 +156,8 @@ def mask_pdf_object_prefix(data: bytes) -> Tuple[bytes, Optional[str], int]:
 
 
 def has_interesting_pdf_stream_type(positions: List[Tuple[int, str]]) -> bool:
+    if any(name == "FIRST" for _position, name in positions):
+        return True
     for index in range(len(positions) - 1):
         if positions[index][1] == "TYPE" and positions[index + 1][1] in ("OBJSTM", "METADATA"):
             return True
@@ -184,6 +211,8 @@ def collect_compressed_pdf_names(data: bytes, names: set) -> bool:
             continue
         if not any(name == "FILTER" for _pos, name in prefix_names):
             continue
+        if any(name in ("DECODEPARMS", "DP") for _pos, name in prefix_names):
+            scan_limited = True
 
         data_start, valid_eol = _stream_data_start(data, stream_at)
         if not valid_eol:
